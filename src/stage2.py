@@ -1,183 +1,226 @@
 import sys, os
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import transforms
 from torchvision.utils import save_image
-from tqdm import tqdm
-from PIL import Image
 
-from src.model import FeatureExtracter
-from src.utils import select_mask
+from src.stage1 import *
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
-def select_mask(features, mask=None):
-    """
-    select activation vectors in mask
-    features: (c, w, h)
-    mask: (w, h)
-    """
-    assert(len(features.shape)==3)
-    if mask is not None:
-        activations = torch.masked_select(features, mask).view(features.shape[0], -1)
+def apply_offset(idx, offset, size):
+    dx, dy = offset
+    w, h = size
+
+    result = idx + dx
+    # check index is not out of horizontal range 
+    if result // w != idx // w:
+        result = -1
     else:
-        activations = features.view(features.shape[0], -1)
+        result += w * dy
+    # check index is not out of vertical range 
+    if result < 0 or result >= w * h:
+        result = -1
+    return result
+
+def second_match(init_map, f_style, mask, kernel_size=5):
+    # init_map = nearest_search(f_input, f_style, mask)
+
+    c, w, h = f_style.shape
+    # grid pointing to neighbor
+    rad = (kernel_size - 1) // 2
+    grid = [np.array([i,j]) for i in range(-rad,rad+1) for j in range(-rad,rad+1)]
     
-    return activations
+    f_style = select_mask(f_style).t() # shape: (w*h, c)
+    mask = mask.view(w*h, 1)
+    result = init_map
+    k = -1
+    for i in range(f_style.shape[0]):
+        if mask[i] == 0:
+            continue
+        else:
+            k += 1
+        candidates = set()
+        ngb_s = []
+        for offset in grid:
+            i = apply_offset(i, offset, (w, h))
+            if i != -1:
+                j = apply_offset(init_map[k].item(), -offset, (w, h))
 
-
-def prepare_input(data_dir, index):
-    # open images with PIL library
-    img_style = Image.open(os.path.join(data_dir, f'{index}_target.jpg'))
-    img_content = Image.open(os.path.join(data_dir, f'{index}_naive.jpg'))
-    img_inter = Image.open(os.path.join(data_dir, f'{index}_stage1_out.jpg'))
-    img_mask = Image.open(os.path.join(data_dir, f'{index}_c_mask_dilated.jpg'))
-
-    # transforms used by all pretrained models in pytorch, ref: https://pytorch.org/docs/stable/torchvision/models.html
-    to_tensor = transforms.ToTensor()
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-                                     std =[0.229, 0.224, 0.225])
-    
-    tsfm = transforms.Compose([to_tensor, normalize])
-
-    # transform images and expand batch dimension
-    tensor_style = tsfm(img_style).unsqueeze_(0)
-    tensor_content = tsfm(img_content).unsqueeze_(0)
-    tensor_inter = tsfm(img_stage1_out).unsqueeze_(0)
-
-    tensor_batch = torch.cat([tensor_style, tensor_content, tensor_inter], dim=0) # concat style and content images
-
-    return tensor_batch, img_mask
-
-
-def resize_masks(mask, reference_output):
-    result = []
-    for l in reference_output:
-        to_tensor = transforms.ToTensor()
-        resize = transforms.Resize(l.shape[-2:])
-
-        tensor_mask = to_tensor(resize(mask))[0] # apply transforms and drop color channels
+                if j != -1:
+                    candidates.add(j)
+                    ngb_s.append(j)
+        candidates = torch.tensor(list(candidates), device=device, dtype=torch.int64)
+        ngb_s = torch.tensor(ngb_s, device=device, dtype=torch.int64)
         
-        result.append(tensor_mask.byte().to(device))
+        if len(candidates) <= 1:
+            assert(not candidates.empty())
+            assert(candidates[0] == i)
+        
+        cand_ft = torch.index_select(f_style, 0, candidates)
+        ngbr_ft = torch.index_select(f_style, 0, ngb_s)
+        l2_dist = ((cand_ft[:, None, :] - ngbr_ft[None,:, :]) ** 2)
+        l2_dist = l2_dist.sum(dim=2).sum(dim=1)
+        result[k] = candidates[torch.argmin(l2_dist)]
+
     return result
 
 
-def get_patches(features, mask=None):
-    grid = [(-1, -1), (-1, 0), (-1, 1),
-            ( 0, -1), ( 0, 0), ( 0, 1),
-            ( 1, -1), ( 1, 0), ( 1, 1)]
-    c, w, h = features.shape
-    if mask is None:
-        mask = torch.ones((w, h), dtype=torch.uint8)
-    assert(mask.shape == (w, h))
+def upsample(ref_map, ref_size, new_size, mask_ref, mask_new):
+    r_h, r_w = ref_size
+    n_h, n_w = new_size
+    new_map = torch.zeros(mask_new.sum().item(), device=device, dtype=torch.int64)
+    ratio_h, ratio_w = n_h/r_h, n_w/r_w
+    k = -1
+    l = -1
+
+    ref_idx_map = torch.full(mask_ref.shape, -1, device=device, dtype=torch.int64).masked_scatter_(mask_ref, ref_map)
+    uniq_mask = torch.zeros_like(mask_new, dtype=torch.uint8) # mask that covers unique elts(activations) only
+    uniq_elts = set()
+    for i in range(n_h * n_w):
+        n_x, n_y = i//n_w, i%n_w
+        r_x, r_y = int((0.5+n_x) / ratio_h), int((0.5+n_y)/ratio_w)
+        r_x, r_y = min(max(0,r_x),r_h-1), min(max(0,r_y),r_w-1)
+
+        if mask_new[n_x, n_y] == 0 or mask_ref[r_x, r_y] == 0:
+            continue
+        else: 
+            k += 1
+            
+        style_idx = ref_idx_map[r_x, r_y].item()
+        s_x = int(n_x + (style_idx // r_w - r_x) * ratio_h + 0.5)
+        s_y = int(n_y + (style_idx % r_w - r_y) * ratio_w + 0.5)
+        s_x, s_y = min(max(0,s_x),n_h-1), min(max(0,s_y),n_w-1)
+        new_map[k] = s_x * n_w + s_y
+
+        if style_idx not in uniq_elts:
+            uniq_elts.add(style_idx)
+            uniq_mask[n_x, n_y] = 1
+
+    return new_map, uniq_mask
+
+def hist_mask(ft_style, uniq_mask, n_bins=256):
+    ft_style = ft_style.cpu()
+    uniq_mask = uniq_mask.cpu()
+    masked = torch.masked_select(ft_style, uniq_mask).view(ft_style.shape[0], -1)
+    return torch.cat([torch.histc(l, n_bins).unsqueeze(0) for l in masked])
+
+def remap_hist(x, hist_ref, n_bins=256):
+    ch, n = x.size()
+    sorted_x, sort_idx = x.data.sort(1)
+    ymin, ymax = sorted_x[:, 0].unsqueeze(1), sorted_x[:, -1].unsqueeze(1)
+
+    hist = hist_ref / hist_ref.sum(1).unsqueeze(1)# Normalization between the different lengths of masks.
+    hist = hist.to(device)
     
+    cum_ref = n * hist.cumsum(1).to(device)
+    cum_prev = torch.cat([torch.zeros(ch, 1, device=device), cum_ref[:,:-1]],1)
+    step = (ymax-ymin)/n_bins
+
+    rng = torch.arange(1,n+1).unsqueeze(0).to(device) # rng: range
     
-    features = F.pad(features[None], (1, 1, 1, 1)).squeeze(0)
-    mask = F.pad(mask, (2, 2, 2, 2))
-    selected = []
-    for offset in grid:
-        dx, dy = offset
-        x0, y0 = 1, 1
-        x1, y1 = w+3, h+3
-        
-        offset_mask = mask[x0+dx : x1+dx , y0+dy : y1+dy].to(device)
-        selected.append(select_mask(features, offset_mask))
-    patches = torch.cat(selected)
-    return patches
-
-
-def independent_mapping(f_input, f_style, mask):
-    patch_input = get_patches(f_input, mask)
-    patch_style = get_patches(f_style)
+    idx = torch.cat([(cum_ref < k).sum(1, keepdim=True) for k in range(1, n + 1)], dim=1).long().to(device)
     
-    # compute matrix of l2 norm between each pairs of patches
-    l2_input = torch.sum(patch_input**2, dim=0).unsqueeze_(1)
-    l2_style = torch.sum(patch_style**2, dim=0).unsqueeze_(0)
-    
-    l2_matrix = -2 * torch.mm(patch_input.t(), patch_style) + l2_input + l2_style # sqrt is omitted since it will have no effect on comparing
+    ratio = (rng - torch.take(cum_prev, idx).view(ch, -1)) / (1e-8 + torch.take(hist, idx)).view(ch, -1)
+    ratio = ratio.squeeze().clamp(0,1)
+    new_x = ymin + (ratio + idx.float()) * step
+    new_x[:,-1] = ymax.squeeze(1)
+    new_x = torch.take(new_x,idx).view(ch, -1)
+    return new_x
 
-    nearest_idx = torch.argmin(l2_matrix, dim=1)
-    
-    # remap the activation vectors of style features using nearest indices
-    mapped_features = torch.cat([row.take(nearest_idx).unsqueeze(0) for row in select_mask(f_style)], dim=0)
-    mapped_style = f_style.masked_scatter(mask, mapped_features)
-    
-    return mapped_style
+def hist_loss(fts_target, fts_hist, masks, indices=[0, 3]):
+    h_loss = 0
+    for i, (target, mask, ref_hist) in enumerate(zip(fts_target, masks, fts_hist)):
+        if i in indices:
+            target = select_mask(target.squeeze(0), mask)
+            h_loss += F.mse_loss(target, remap_hist(target, ref_hist)) 
+    return h_loss / 2
 
-
-def gram(inp):
-    mat = inp.view(inp.shape[0], -1)
-    return torch.mm(mat, mat.t())
-
-def loss_content(output, refer, mask):
-    return F.mse_loss(
-        select_mask(output, mask),
-        select_mask(refer, mask))
-
-def loss_style(output, refer, mask):
-    return F.mse_loss(
-        gram(select_mask(output, mask)),
-        gram(select_mask(refer, mask)))
-
-
-def stage1_loss(fts_target, fts_refer, masks):
-    w_s = 10
-    w_c = 1
-    s_layers = [2, 3, 4]
-    c_layers = [3]
-
-    c_loss = 0
+def loss_style_stage2(fts_target, fts_style, masks, tmasks, weight=0.01):
     s_loss = 0
-    for i, (target, refer, mask) in enumerate(zip(fts_target, fts_refer, masks)):
-        ref_s, ref_c = torch.unbind(refer)
-        if i in s_layers:
-            s_loss += loss_style(target[0], ref_s, mask) / 3
+    for target, ref_s, mask, tmask in zip(fts_target, fts_style, masks, tmasks):
+        target = select_mask(target.squeeze(0), mask)
+        ref_s = select_mask(ref_s, tmask)
 
-        if i in c_layers:
-            c_loss += loss_content(target[0], ref_c, mask)
-    loss = w_s * s_loss + w_c * c_loss
-    return loss
+        ref_s *= float(np.sqrt(mask.sum() / tmask.sum())) # regularize differences of n_elts of masks
+        s_loss += gram_mse(target, ref_s)
+    return s_loss * weight / 4
 
+def loss_totvar(out):
+    return ((out[:,:-1,:] - out[:,1:,:]) ** 2).sum() + ((out[:,:,:-1] - out[:,:,1:]) ** 2).sum()
 
+def get_med_tv(arr):
+    ch, h, w = arr.shape
+    arr1 = torch.cat([torch.zeros((ch,w), device=device)[:,None,:], arr], dim=1)
+    arr2 = torch.cat([torch.zeros((ch,h), device=device)[:,:,None], arr], dim=2)
+    return torch.median((arr1[:,:-1,:] - arr1[:,1:,:]) ** 2 + (arr2[:,:,:-1] - arr2[:,:,1:]) ** 2)
+
+def stage2_loss(opt_img, style_tfm, output, ref_style, ref_content, ref_hist, masks, uniq_masks):
+    mtv = get_med_tv(style_tfm)
+    w_tv = float(10 / (1 + np.exp(min(mtv * 10**4 -25, 30)))) # TODO: handling overflow here
+
+    c_loss = loss_content(output[3].squeeze(0), ref_content[3], masks[3], )
+    s_loss = loss_style_stage2(output, ref_style, masks, uniq_masks)
+    h_loss = hist_loss(output, ref_hist, masks, indices=[0, 3])
+    t_loss = loss_totvar(opt_img[0])
+    # print(c_loss.item(), s_loss.item(), h_loss.item(), (w_tv * t_loss).item())
+    return c_loss + s_loss + h_loss + w_tv * t_loss
+## copy and pasted parts to here
 
 if __name__ == '__main__':
     model = FeatureExtracter().to(device)
-    image_index = 16
-    batch_inputs, img_mask = prepare_input(data_dir='data/', index=image_index)
+    image_index = 8
+    batch_inputs, img_tight_mask, img_dil_mask = prepare_input(data_dir='data/', index=image_index, stage=2)
     batch_inputs = batch_inputs.to(device)
 
     # print(model)
-    features = model(batch_inputs) # python list of activations 
-    ref_features = []
-    masks = resize_masks(img_mask, features)
+    features = model(batch_inputs)[:-1] # python list of activations, drop last layer features
+    ref_style = []
+    ref_content = []
+    uniq_masks = []
+    masks = resize_masks(img_dil_mask, features)
+    tmasks = resize_masks(img_tight_mask, features)
 
-    print('Pass1: Begin Independent Mapping')
+    print('Stage2: Begin Mapping')
     with torch.no_grad():
         for i, (feat, mask) in enumerate(zip(features, masks)):
             feat_no_grad = feat
-            if i in [2, 3, 4]:
-                # mask = mask.byte().to(device)
-                f_style = feat[0]
-                f_content = feat[1]
-                feat[0] = independent_mapping(f_content, f_style, mask)
-                feat_no_grad = feat.detach()
-            ref_features.append(feat_no_grad)
+            f_style, f_content, f_stage1 = torch.unbind(feat.detach(), dim=0)
+            if i == 3:
+                init_map = nearest_search(f_stage1, f_style, mask)
+                sec_map = second_match(init_map, f_style, mask, kernel_size=5) # TODO: try with resized original style image 
+                mask_ref = mask
+                size_ref = f_style.shape[-2:]
+            
+            ref_style.append(f_style)
+            ref_content.append(f_stage1) 
+
+        for i, (f_style, mask) in enumerate(zip(ref_style, masks)):
+            new_map, uniq_mask = upsample(sec_map, size_ref, f_style.shape[-2:], mask_ref, mask)
+            uniq_masks.append(uniq_mask)
 
 
-    print('Pass1: Begin Reconstruction')
+        ref_hist = []
+        for i, (f_style, uniq_mask) in enumerate(zip(ref_style, uniq_masks)):
+            if i in [0, 3]:
+                hist = hist_mask(f_style, uniq_mask)
+                ref_hist.append(hist)
+                # print(hist.shape)
 
-    # prepare image to be optimized by copying content image
-    content = batch_inputs[1].unsqueeze(0)
-    opt_img = torch.zeros_like(content).new_tensor(content.data, device=device, requires_grad=True)
 
-    optimizer = optim.LBFGS([opt_img], lr=1)
+    print('Stage2: Begin Reconstruction')
+
+    # prepare image to be optimized by copying stage1 output image
+    content = batch_inputs[2].unsqueeze(0)
+    opt_img = torch.tensor(content.data, requires_grad=True)
+
+    optimizer = optim.LBFGS([opt_img], lr=0.1)
     n_iter = 0
-    max_iter = 1000
-    show_iter = 100
+    max_iter = 200
+    show_iter = 10
     while  n_iter <= max_iter: 
         def closure():
             optimizer.zero_grad()
@@ -185,21 +228,27 @@ if __name__ == '__main__':
             n_iter += 1
             output = model(opt_img)
 
-            loss = stage1_loss(output, ref_features, masks)
+            loss = stage2_loss(opt_img, batch_inputs[1], output, ref_style, ref_content, ref_hist, masks, uniq_masks)
             loss.backward()
             if n_iter % show_iter == 0: 
                 print(f'Iteration: {n_iter}, loss: {loss.item()}')
             return loss
         optimizer.step(closure)
 
-    output_path = f'data/{image_index}_stage1_out'
+    
+    output_path = f'data/{image_index}_stage2_out'
+
     with torch.no_grad():
-        np.save(f'{output_path}.npy', opt_img.data.cpu().numpy())
+        tight_mask = tmasks[0].float()
+        output_img = opt_img * tight_mask + batch_inputs[0] * (1 - tight_mask)
+
+        np.save(f'{output_path}.npy', output_img.data.cpu().numpy())
         # print(opt_img.shape)
         
         #denormalize and save output image
         inv_tsfm = transforms.Compose([
             transforms.Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.255], std=[1/0.229, 1/0.224, 1/0.255]), 
+            lambda x: x.clamp(0, 1),
             transforms.ToPILImage()])
-        inv_tsfm(opt_img.cpu().data[0]).save(f'{output_path}.jpg')
+        inv_tsfm(output_img.cpu().data[0]).save(f'{output_path}.jpg')
         

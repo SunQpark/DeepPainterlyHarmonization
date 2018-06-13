@@ -15,7 +15,7 @@ class FeatureExtracter(nn.Module):
             x = l(x)
             out.append(x)
         return out
-
+        
     def _slice_layers(self, model, indices):
         layers = []
         for i in range(len(indices) - 1):
